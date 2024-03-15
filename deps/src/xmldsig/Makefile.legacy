@@ -1,0 +1,24 @@
+# all paths are given for rsdev64
+# xmlsec1 doesn't support GOST algorithm by default
+
+XMLSEC = /usr/local/xmlsec1-1.2.20
+
+PERL_INC= `perl -MExtUtils::Embed -e perl_inc`
+FLAGS = -Wall -fPIC -shared $(shell $(XMLSEC)/bin/xmlsec1-config --cflags) $(PERL_INC)
+FLAGS += -Xlinker -rpath -Xlinker $(XMLSEC)/lib
+FLAGS += -Xlinker -rpath -Xlinker /usr/local/libxml2-2.9.2/lib
+FLAGS += -Xlinker -rpath -Xlinker /usr/local/openssl-1.0.2/lib
+LIBS = $(shell $(XMLSEC)/bin/xmlsec1-config --libs)
+
+all:
+	g++ $(FLAGS) -o xmldsig.so main.cpp xml.cpp perlparams.cpp $(LIBS)
+	strip xmldsig.so
+
+clean:
+	rm -f xmldsig.so
+	rm -f xpath
+
+# to test XPath expressions
+xpath:
+	g++ -Wall -I/usr/include/libxml2 -o xpath xpath.cpp $(LIBS)
+

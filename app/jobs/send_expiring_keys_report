@@ -1,0 +1,219 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use utf8;
+
+use Date::Calc;
+use Encode;
+use FindBin '$RealBin';
+use HTML::Entities;
+use MIME::Base64;
+use MIME::Lite;
+use Sys::Syslog;
+
+use lib "$RealBin/../lib";
+
+use CyberFT::Database;
+use CyberFT::Utils;
+
+$0 = $FindBin::Script;
+
+my $log;
+
+eval {
+    main();
+};
+if (my $err = $@) {
+    _log("error", "Error in main(): $err");
+}
+
+sub main {
+    my $config = CyberFT::Utils::read_app_config();
+    my $db = CyberFT::Database::new_instance($config);
+    if (ref($db) ne 'CyberFT::Database::PostgresDatabase') {
+        return;
+    }
+
+    openlog($config->{log_ident}, 'ndelay,pid', $config->{log_facility});
+    $log = CyberFT::Utils::log_func_syslog($0);
+
+    _log('info', 'Connecting to the database: ' . $config->{db_data_source});
+    my $connect_result = $db->connect($config);
+    if ($connect_result->{Result} ne '0') {
+        die('Database connection error: ' . $connect_result->{ErrMsg});
+    }
+
+    _log('info', 'Start');
+
+    create_and_send_report($db, $config);
+
+    _log('info', 'Finished');
+}
+
+sub create_and_send_report {
+    my ($db, $config) = @_;
+
+    my $sys_params = $db->get_sys_params();
+    unless ($sys_params->{SENDER_EMAIL} && $sys_params->{EXPIRED_KEYS_RECIPIENTS}) {
+        _log('warning', 'Invalid system settings, please check SENDER_EMAIL and EXPIRED_KEYS_RECIPIENTS options');
+        return;
+    }
+
+    my @recipient_emails = split /[\s,]+/, $sys_params->{EXPIRED_KEYS_RECIPIENTS};
+    die 'Got empty recipients list' unless @recipient_emails > 0;
+
+    my $fetch_data_result = fetch_report_data($db);
+    if ($fetch_data_result->{Result} ne '0') {
+        _log('warning', "Failed to get expiring keys, error: $fetch_data_result->{ErrCode}, $fetch_data_result->{ErrMsg}");
+        return;
+    }
+    my $keys = $fetch_data_result->{Data};
+    if (@$keys == 0) {
+        _log('info', 'No expiring keys found');
+        return;
+    }
+
+    my $report_body = create_email_body($keys);
+
+    my $subject = sprintf 'Окончание срока действия сертификатов %02d.%02d.%04d', reverse(Date::Calc::Today);
+    send_email($sys_params->{SENDER_EMAIL}, $_, $subject, $report_body, $config->{smtp_host}) for @recipient_emails;
+}
+
+sub send_email {
+    my ($email_from, $email_to, $subject, $html_body, $smtp_host) = @_;
+
+    my $subject_rfc2047 = '=?UTF-8?B?'. MIME::Base64::encode(Encode::encode_utf8($subject), '') . '?=';
+
+    my $message = MIME::Lite->new(
+        From    => $email_from,
+        To      => $email_to,
+        Subject => $subject_rfc2047,
+        Type    => 'multipart/mixed'
+    );
+    $message->attach(
+        Type => 'text/html; charset=utf-8',
+        Data => Encode::encode_utf8($html_body)
+    );
+    my $isSent = $smtp_host ? $message->send('smtp', $smtp_host) : $message->send();
+
+    _log('warning', "Failed to send email to $email_to") unless $isSent;
+}
+
+sub create_email_body {
+    my ($keys) = @_;
+
+    my $escape_html = sub { encode_entities(shift, '<>&"\'') };
+
+    my $create_row = sub {
+        my ($key) = @_;
+
+        return '<tr>'
+            . '<td>' . $escape_html->($key->{member_name}) . '</td>'
+            . '<td>' . $escape_html->($key->{swift_code}) . '</td>'
+            . '<td>' . $escape_html->($key->{key_id}) . '</td>'
+            . '<td>' . $escape_html->($key->{role_name}) . '</td>'
+            . '<td>' . $escape_html->($key->{end_date}) . '</td>'
+            . '<td>' . $escape_html->($key->{operator_name}) . '</td>'
+            . '</tr>';
+    };
+
+    my @table_rows = map { $create_row->($_) } @$keys;
+    my $table_rows = join('', @table_rows);
+
+    return
+        qq{<html>
+            <head>
+                <style>
+                    h1 {
+                        font-size: 20px;
+                    }
+                    table, td, th {
+                        border: 1px solid black;
+                        font-size: 12px;
+                        padding: 2px;
+                    }
+                    table {
+                        border-collapse: collapse;
+                        vertical-align: top;
+                        width: 100%;
+                    }
+                </style>
+            </head>
+            <body>
+                <h1>Окончание срока действия сертификатов</h1>
+                <table>
+                    <tr>
+                        <th>Участник</th>
+                        <th>BICFT</th>
+                        <th>Сертификат</th>
+                        <th>Роль</th>
+                        <th>Срок действия</th>
+                        <th>ФИО Оператора</th>
+                    </tr>
+                    $table_rows
+                </table>
+            </body>
+        </html>};
+}
+
+sub fetch_report_data {
+    my ($db) = @_;
+
+    my $query = q{
+        select
+            piiserrorout                          as is_error,
+            pcerrcodeout                          as err_code,
+            pcerrmsgout                           as err_msg,
+            pikeyout                              as key_id,
+            pckeycodeout                          as key_code,
+            pcmembernameout                       as member_name,
+            pcswiftcodeout                        as swift_code,
+            pcrolenameout                         as role_name,
+            to_char(pdatenddateout, 'DD.MM.YYYY') as end_date,
+            pcoperatornameout                     as operator_name
+        from cyberft.p_system_api_get_expired_keys()
+    };
+
+    my ($sth, $err) = $db->prepare($query);
+    if (defined $err) {
+        return { Result => -1, ErrCode => -1, ErrMsg => 'Cannot prepare db query: ' . $err };
+    }
+
+    my $res = $sth->execute();
+    unless ($res) {
+        return { Result => -1, ErrCode => -1, ErrMsg => 'Cannot execute db query: ' . $sth->errstr };
+    }
+
+    my $keys = [];
+    while (my $row = $sth->fetchrow_hashref) {
+        if ($row->{has_error}) {
+            return {
+                Result  => $row->{has_error} ? -1 : 0,
+                ErrCode => $row->{error_code},
+                ErrMsg  => $row->{has_error} ? $row->{error_message} : 'Success',
+            };
+        }
+
+        my $key = {};
+        $key->{$_} = $row->{$_} for qw/key_id key_code member_name swift_code role_name end_date operator_name/;
+
+        push @$keys, $key;
+    }
+
+    return {
+        Result  => 0,
+        ErrCode => undef,
+        ErrMsg  => undef,
+        Data    => $keys,
+    };
+}
+
+sub _log{
+    my $type = shift;
+    my $msg = shift;
+    if (defined $log) {
+        $log->($type, $msg);
+    } else {
+        print STDERR "$0: [$type] $msg\n";
+    }
+};

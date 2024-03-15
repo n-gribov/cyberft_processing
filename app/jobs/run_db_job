@@ -1,0 +1,77 @@
+#!/usr/bin/perl
+use strict;
+use warnings FATAL => 'all';
+
+use FindBin '$RealBin';
+use Sys::Syslog;
+
+use lib "$RealBin/../lib";
+
+use CyberFT::Database;
+use CyberFT::Utils;
+
+$0 = $FindBin::Script;
+
+my $job_name;
+my $log;
+
+eval {
+    main();
+};
+if (my $err = $@) {
+    _log("error", "Error in main(): $err");
+}
+
+sub main {
+    $job_name = get_job_name();
+
+    my $config = CyberFT::Utils::read_app_config();
+    my $db = CyberFT::Database::new_instance($config);
+    if (ref($db) ne 'CyberFT::Database::PostgresDatabase') {
+        return;
+    }
+
+    openlog($config->{log_ident}, 'ndelay,pid', $config->{log_facility});
+    $log = CyberFT::Utils::log_func_syslog("$0/$job_name");
+
+    _log('info', 'Connecting to the database: ' . $config->{db_data_source});
+    my $connect_result = $db->connect();
+    if ($connect_result->{Result} ne '0') {
+        die('Database connection error: ' . $connect_result->{ErrMsg});
+    }
+
+    _log('info', 'Start');
+
+    my $job_result = $db->execute_db_api_function(qq{
+        select
+            piiserrorout as has_error,
+            pcerrcodeout as error_code,
+            pcerrmsgout as error_message
+        from cyberft.p_system_api_$job_name()
+    });
+
+    if ($job_result->{Result} ne '0') {
+        _log('warning', "Database job failed, error: $job_result->{ErrCode}, $job_result->{ErrMsg}");
+    }
+
+    _log('info', 'Finished');
+}
+
+sub get_job_name {
+    my $name = $ARGV[0];
+    die 'Job name parameter is required' unless $name;
+    die 'Invalid job name parameter' unless $name =~ m/^[a-z0-9_]+$/i;
+
+    return $name;
+}
+
+sub _log{
+    my $type = shift;
+    my $msg = shift;
+    if (defined $log) {
+        $log->($type, $msg);
+    } else {
+        my $task = $job_name ? "$0/$job_name" : $0;
+        print STDERR "$task: [$type] $msg\n";
+    }
+};

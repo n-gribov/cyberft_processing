@@ -1,0 +1,233 @@
+#!/usr/bin/perl
+use strict;
+use feature qw(switch);
+use Data::Dumper;
+use File::Copy ();
+use Sys::Syslog;
+use FindBin;
+use Getopt::Long;
+use lib $FindBin::RealBin . '/../lib';
+
+use CyberFT::CFTMQUsersSyncUtils;
+use CyberFT::Database;
+use CyberFT::Utils;
+
+# Имя в списке процессов
+$0 = 'cyberft_users_sync';
+
+my $log;
+my $pid_file;
+
+eval {
+    main();
+};
+if (my $err = $@) {
+    _log("error", "Error in main(): $err");
+}
+
+if (defined $pid_file && -f $pid_file) {
+    CyberFT::Utils::read_file($pid_file, \my $pid);
+    if ($pid == $$) {
+        unlink($pid_file);
+    }
+}
+
+sub main {
+    # Прочитаем конфигурационный файл.
+    my $cfg = CyberFT::Utils::read_app_config();
+    unless (defined $cfg) {
+        die "Error reading config file (config/cyberft.cfg)";
+    }
+
+    # Проверка присутствия обязательных параметров в конфиге.
+    my @required_config_keys = qw(
+        pid_file_users_sync
+        log_ident
+        log_facility
+        broker_username
+        broker_password
+        broker_pid_file
+        broker_users_file
+        broker_admin_password
+        db_data_source
+        db_username
+        db_password
+        temp_dir
+    );
+    for my $key (@required_config_keys) {
+        if (!defined($cfg->{$key}) || $cfg->{$key} =~ /^\s*$/) {
+            die "Error reading required config parameter: $key";
+        }
+    }
+
+    for my $dir_param ('temp_dir') {
+        unless (-d $cfg->{$dir_param}) {
+            die "Bad directory parameter: $dir_param";
+        }
+    }
+
+    openlog($cfg->{log_ident}, "ndelay,pid", $cfg->{log_facility});
+    $log = CyberFT::Utils::log_func_syslog("users_sync");
+
+    return 0 unless need_update($cfg);
+
+    _log("info", "Start");
+
+    # Проверим pid-файл
+    $pid_file = $cfg->{pid_file_users_sync};
+    if (CyberFT::Utils::check_pid($pid_file, qr/users_sync/)) {
+        _log("info", "Script is already running");
+        return 0;
+    }
+    CyberFT::Utils::write_pid($pid_file);
+
+    # Подключимся к базе данных
+    my $db = CyberFT::Database::new_instance($cfg);
+    my $res = $db->connect();
+    if ($res->{Result} ne '0') {
+        die('Database connection error: ' . $res->{ErrMsg});
+    }
+    my $dbh = $db->dbh();
+
+    my $tmp_file = CyberFT::Utils::temp_filename($cfg->{temp_dir}, "users_sync");
+
+    _log("info", "Creating file: " . $tmp_file);
+    open(my $output, ">", $tmp_file) or die "File open error: $!";
+    binmode $output;
+    print $output '################################################', "\n";
+    print $output '# format:', "\n";
+    print $output '# login:hashAlgorithm:passwordHash:salt:role', "\n";
+    print $output '#', "\n";
+    print $output '# role: nolimit, restricted, pull, proxy, router', "\n";
+    print $output '# hashAlgorithm: md5, sha256', "\n";
+    print $output '################################################', "\n";
+    print $output "\n";
+    print $output 'admin:md5:', Digest::MD5::md5_hex($cfg->{broker_admin_password}), '::admin', "\n";
+    print $output $cfg->{broker_username}, ':md5:', Digest::MD5::md5_hex($cfg->{broker_password}), '::nolimit', "\n";
+
+    _log("info", "Fetching client list");
+    my $sth = $dbh->prepare(q{
+        select
+            full_swift_code as member_id,
+            login_param
+        from w_terminals
+        where
+            status = 1
+            and login_param != 'NONE'
+        order by full_swift_code
+    }) || die("Cannot prepare the query: " . $dbh->errstr);
+
+    $sth->execute() || die("Cannot execute the query: " . $sth->errstr);
+
+    while (1) {
+        my $row = $sth->fetchrow_hashref;
+        unless (defined $row) {
+            if ($sth->err) {
+                die("Cannot fetch a row from the database: " . $sth->errstr);
+            }
+            last;
+        }
+
+        if (!defined($row->{login_param}) || $row->{login_param} eq '') {
+            next;
+        }
+
+        my $member_id = $row->{member_id};
+        if ($member_id eq $cfg->{broker_username}) {
+            next;
+        }
+
+        my $hash_algorithm;
+        my $password_hash;
+        my $password_salt;
+        my $role = 'restricted';
+        given ($row->{login_param}) {
+            when (/^[a-z0-9]{32}$/i) {
+                $hash_algorithm = 'md5';
+                $password_hash = $row->{login_param};
+                $password_salt = '';
+            }
+            when (/^(sha256|md5)\|([a-z0-9]+)\|([a-z0-9]*)$/i) {
+                $hash_algorithm = $1;
+                $password_hash = $2;
+                $password_salt = $3;
+            }
+            default {
+                _log('info', "Invalid login params for member $member_id");
+                next;
+            }
+        }
+
+        my $csv_row = join(':', ($member_id, $hash_algorithm, $password_hash, $password_salt, $role));
+        print $output $csv_row, "\n";
+    }
+
+    close($output);
+
+    _log("info", "Calculating MD5 sums");
+    my $old_md5 = CyberFT::Utils::md5_sum_file($cfg->{broker_users_file}) if -f $cfg->{broker_users_file};
+    my $new_md5 = CyberFT::Utils::md5_sum_file($tmp_file);
+
+    if ($old_md5 eq $new_md5) {
+        _log("info", "No changes");
+        _log("info", "Removing file: " . $tmp_file);
+        unlink($tmp_file) or die "File unlink error: $!";
+    } else {
+        _log("info", "New file MD5 differs ($new_md5 vs $old_md5)");
+        _log("info", "Replacing users file: " . $cfg->{broker_users_file});
+        File::Copy::move($tmp_file, $cfg->{broker_users_file}) or die "File move error: $!";
+        _log("info", "Reading broker PID file");
+        my $pid = read_pid_file($cfg->{broker_pid_file});
+        _log("info", "Sending HUP signal to the broker (pid=$pid)");
+        my $r = kill('HUP', $pid);
+        if ($r != 1) {
+            die "Bad kill return value: $r";
+        } else {
+            _log("info", "OK");
+        }
+    }
+
+    CyberFT::CFTMQUsersSyncUtils::save_users_sync_status({
+        config                => $cfg,
+        last_update_timestamp => time(),
+        force_update          => 0
+    });
+
+    _log("info", "Stop");
+    return 1;
+}
+
+sub _log{
+    my $type = shift;
+    my $msg = shift;
+    if (defined $log) {
+        $log->($type, $msg);
+    } else {
+        print STDERR "users_sync: <$type> $msg\n";
+    }
+};
+
+sub read_pid_file {
+    my ($filename) = @_;
+    open(my $input, "<", $filename) or die "File open error: $!";
+    binmode $input;
+    my $data = do { local $/ = undef; <$input> };
+    close $input;
+    if ($data =~ /^\s*(\d+)\s*$/) {
+        return $1;
+    } else {
+        die "Bad PID file data";
+    }
+}
+
+sub need_update {
+    my ($config) = @_;
+
+    GetOptions('force' => \my $force);
+    return 1 if $force;
+
+    my $users_sync_status = CyberFT::CFTMQUsersSyncUtils::get_users_sync_status($config);
+
+    my $is_outdated = 1 if $users_sync_status->{last_update_timestamp} + $config->{users_sync_update_interval} <= time();
+    return $is_outdated || $users_sync_status->{force_update};
+}

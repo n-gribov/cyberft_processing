@@ -1,0 +1,257 @@
+#!/usr/bin/perl
+use strict;
+use Data::Dumper;
+use File::Copy ();
+use Sys::Syslog;
+use FindBin;
+use lib $FindBin::RealBin . '/../lib';
+use CyberFT::Utils;
+use CyberFT::Broker;
+use CyberFT::Database;
+use CyberFT::Errors;
+
+# Имя в списке процессов
+$0 = 'cyberft_recv_acks';
+
+my $log;
+my $pid_file;
+
+eval {
+    main();
+};
+if (my $err = $@) {
+    _log("error", "Error in main(): $err");
+}
+
+if (defined $pid_file && -f $pid_file) {
+    CyberFT::Utils::read_file($pid_file, \my $pid);
+    if ($pid == $$) {
+        unlink($pid_file);
+    }
+}
+
+sub main {
+    # Прочитаем конфигурационный файл.
+    my $cfg = CyberFT::Utils::read_app_config();
+    unless (defined $cfg) {
+        die "Error reading config file (config/cyberft.cfg)";
+    }
+
+    # Проверка присутствия обязательных параметров в конфиге.
+    my @required_config_keys = qw(
+        pid_file_recv_acks
+        log_ident
+        log_facility
+        broker_host
+        broker_port
+        broker_username
+        broker_password
+        db_data_source
+        db_username
+        db_password
+        sys_id
+    );
+    for my $key (@required_config_keys) {
+        if (!defined($cfg->{$key}) || $cfg->{$key} =~ /^\s*$/) {
+            die "Error reading required config parameter: $key";
+        }
+    }
+
+    openlog($cfg->{log_ident}, "ndelay,pid", $cfg->{log_facility});
+    $log = CyberFT::Utils::log_func_syslog("recv_acks");
+
+    _log("info", "Start");
+
+    # Проверим pid-файл
+    $pid_file = $cfg->{pid_file_recv_acks};
+    if (CyberFT::Utils::check_pid($pid_file, qr/recv_acks/)) {
+        _log("info", "Script is already running");
+        return 0;
+    }
+    CyberFT::Utils::write_pid($pid_file);
+
+    # Подключимся к базе данных
+    _log("info", "Connecting to the database: " . $cfg->{db_data_source});
+    my $db = CyberFT::Database::new_instance($cfg);
+    my $res_connect = $db->connect();
+    if ($res_connect->{Result} ne '0') {
+        _log("error", 'Database connection error: ' . $res_connect->{ErrMsg});
+        return;
+    }
+
+    # Подключимся к брокеру.
+    _log('info', 'Connecting to the message broker: ' . $cfg->{broker_host} . ':' . $cfg->{broker_port});
+    my $broker = CyberFT::Broker->new;
+    my $r = $broker->connect(
+        $cfg->{broker_host},
+        $cfg->{broker_port},
+        $cfg->{broker_username},
+        $cfg->{broker_password},
+        $log,
+        10,
+    );
+    if ($r->{Result} ne '0') {
+        _log("error", 'Message broker connection error: ' . $r->{ErrMsg});
+        save_error($db, ERR_CHECK_ACKS, 'Failed to connect to the message broker');
+        return;
+    }
+
+    _log("info", "Fetching processing list");
+    my $sth = $db->dbh->prepare(q{
+        SELECT t.full_swift_code,    -- swift-код терминала (12 символов)
+               t.member_swift_code,  -- swift-код процессинга (11 символов)
+               t.login_addr          -- Параметр соединения
+          FROM (SELECT DISTINCT dst_node FROM w_routing_table) r, --таблица маршрутизации
+               w_terminals t  --терминалы
+          WHERE r.dst_node = t.member_id
+            AND t.status > 0   -- активные терминалы
+    }) || die("Cannot prepare the query: " . $db->dbh->errstr);
+
+    my $exec_res = $sth->execute() || die("Cannot execute the query: " . $sth->errstr);
+    if (!$exec_res) {
+        _log("error", 'Cannot execute the query: ' . $sth->errstr);
+        save_error($db, ERR_RECV_ACKS, 'Failed to execute db query');
+        return;
+    }
+
+    while (1) {
+        my $row = $sth->fetchrow_hashref;
+        unless (defined $row) {
+            if ($sth->err) {
+                _log("error", "Failed to fetch a row from the database: " . $sth->errstr);
+                save_error($db, ERR_RECV_ACKS, "Failed to fetch a row from the database");
+            }
+            last;
+        }
+        my $processing_id = $row->{full_swift_code};
+        my $processing_addr = $row->{login_addr};
+
+        recv_all_messages($cfg, $broker, $processing_id, $processing_addr, $db);
+    }
+
+    $db->disconnect;
+    $broker->disconnect;
+
+    _log("info", "Stop");
+    return 1;
+}
+
+sub recv_all_messages {
+    my ($cfg, $broker, $processing_id, $processing_addr, $db) = @_;
+
+    # TODO: вынести эти настройки в конфиг?
+    my $timeout = 5; # Таймаут ожидания следующего сообщения
+    my $max_recv_time = 60; # Максимальное время получения сообщений от одного процессинга
+
+    my ($host, $port, $pass) = split(':', $processing_addr);
+
+    _log("info", "Connecting to remote broker: $processing_id ($host:$port)");
+
+    if ($processing_id eq $cfg->{sys_id}) {
+        _log("warning", "Cannot connect to self: probably incorrect routing table");
+        save_error($db, ERR_RECV_ACKS, "Cannot connect to self: probably incorrect routing table");
+        return;
+    }
+
+    if (!defined($host) || $host eq '' || !defined($port) || $port eq '' || !defined($pass) || $pass eq '') {
+        _log("warning", "Cannot connect: Empty host, port or password part of login_addr");
+        save_error($db, ERR_RECV_ACKS, "Cannot connect: Empty host, port or password part of login_addr");
+        return;
+    }
+
+    my $r_broker = CyberFT::Broker->new;
+    my $r = $r_broker->connect(
+        $host,
+        $port,
+        $cfg->{sys_id},
+        $pass,
+        $log,
+        10,
+    );
+    if ($r->{Result} ne '0') {
+        _log('error', 'Message broker connect error: ' . $r->{ErrMsg});
+        save_error($db, ERR_RECV_ACKS, "Message broker connect error");
+        return $r;
+    }
+
+    _log("info", "Subscribing to: " . $cfg->{sys_id});
+    my $r = $r_broker->subscribe($cfg->{sys_id});
+    if ($r->{Result} ne '0') {
+        $r_broker->disconnect;
+        _log('error', 'Message broker subscribe error: ' . $r->{ErrMsg});
+        save_error($db, ERR_RECV_ACKS, "Message broker subscribe error");
+        return $r;
+    }
+
+    my $start_time = time();
+    while (1) {
+        my $r = $r_broker->recv_frame($timeout);
+        if ($r->{Result} ne '0') {
+            _log('error', 'Message broker recv_frame error: ' . $r->{ErrMsg});
+            save_error($db, ERR_RECV_ACKS, "Message broker recv_frame error");
+            return $r;
+        }
+        my $frame = $r->{Frame};
+        if (defined $frame) {
+            _log("info", "Received frame");
+        } else {
+            _log("info", "Received nothing");
+            last;
+        }
+
+        my $new_headers = {
+            real_source => $frame->headers->{source},
+            doc_id      => $frame->headers->{doc_id},
+            sender_id   => $frame->headers->{sender_id},
+            doc_type    => $frame->headers->{doc_type},
+        };
+
+        my $r = $broker->send_frame("INPUT", $frame->body, $new_headers, $timeout);
+        if ($r->{Result} ne '0') {
+            save_error($db, ERR_RECV_ACKS, "Message broker send_frame error");
+            die('Message broker send_frame error: ' . $r->{ErrMsg});
+        }
+
+        last if (time() - $start_time > $max_recv_time);
+
+        my $r = $r_broker->send_ack($frame);
+        if ($r->{Result} ne '0') {
+            _log('error', 'Message broker send_ack error: ' . $r->{ErrMsg});
+            save_error($db, ERR_RECV_ACKS, "Message broker send_ack error");
+            return $r;
+        }
+    }
+
+    $r_broker->disconnect;
+    return {Result => 0, ErrCode => 0, ErrMsg => ''};
+}
+
+sub save_error {
+    my $db = shift;
+    my $err_number = shift;
+    my $param1 = shift // '';
+    my $param2 = shift // '';
+    my $param3 = shift // '';
+
+    my $res = $db->save_external_error({
+        Error => $err_number,
+        Par1  => $param1,
+        Par2  => $param2,
+        Par3  => $param3,
+    });
+
+    if ($res->{Result} ne '0') {
+        _log('warning', "save_error: ($err_number, $param1, $param2, $param3):".
+             "save_external_error error: " . $res->{ErrCode} . ': ' . $res->{ErrMsg});
+    }
+}
+
+sub _log{
+    my $type = shift;
+    my $msg = shift;
+    if (defined $log) {
+        $log->($type, $msg);
+    } else {
+        print STDERR "recv_acks: <$type> $msg\n";
+    }
+};

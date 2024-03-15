@@ -1,0 +1,321 @@
+#!/usr/bin/perl
+
+# Usage:
+#     bicdir_export --type=all
+#     bicdir_export --type=increment
+#     bicdir_export --type=increment --date=2016-01-01
+
+use strict;
+use Data::Dumper;
+use Sys::Syslog;
+use FindBin;
+use Getopt::Long;
+use Date::Calc ();
+use File::Copy ();
+use Archive::Zip qw( :ERROR_CODES :CONSTANTS );
+use Text::Iconv;
+
+use lib $FindBin::RealBin . '/../lib';
+use CyberFT::Utils;
+use CyberFT::Database;
+use CyberFT::Errors;
+
+my $log;
+
+my $CSV_VERSION = '1.0';
+my $CSV_ENCODING = 'windows-1251';
+my $CSV_COLUMNS = [
+    {db_name => 'exp_id',               desc => 'ID записи экспорта'},
+    {db_name => 'swift_code',           desc => 'CyberFT/BIC Участника'},
+    {db_name => 'parent_swift_code',    desc => 'CyberFT/BIC Провайдера'},
+    {db_name => 'member_type',          desc => 'Тип'},
+    {db_name => 'member_name',          desc => 'Краткое наименование на русском языке'},
+    {db_name => 'eng_name',             desc => 'Наименование на английском языке'},
+    {db_name => 'is_bank',              desc => 'Признак кредитной организации'},
+    {db_name => 'status',               desc => 'Статус'},
+    {db_name => 'blocked',              desc => 'Блокировка'},
+    {db_name => 'cntr_code2',           desc => 'Страна'},
+    {db_name => 'city_name',            desc => 'Город'},
+    {db_name => 'valid_from',           desc => 'Действителен с'},
+    {db_name => 'valid_to',             desc => 'Действителен по'},
+    {db_name => 'website',              desc => 'Web-сайт(ы)'},
+    {db_name => 'member_phone',         desc => 'Телефон(-ы) контакт-центра'},
+    {db_name => 'lang_num',             desc => 'Язык'},
+];
+
+# eval {
+    main();
+# };
+if (my $err = $@) {
+    _log("error", "Error in main(): $err");
+}
+
+sub main {
+    my $type = '';
+    my $export_date = '';
+    GetOptions('type=s' => \$type, 'date=s' => \$export_date);
+    unless ($type =~ /^(all|increment)$/) {
+        die "Required command line option --type unspecified or invalid. Valid values: 'all' or 'increment'";
+    }
+    if ($export_date ne '' && $export_date !~ /^\d\d\d\d\-\d\d-\d\d$/) {
+        die "Bad format of the command line option --date. Should be YYYY-MM-DD";
+    }
+    
+    # Прочитаем конфигурационный файл.
+    my $cfg = CyberFT::Utils::read_app_config();
+    unless (defined $cfg) {
+        die "Error reading config file (config/cyberft.cfg)";
+    }
+
+    # Проверка присутствия обязательных параметров в конфиге.
+    my @required_config_keys = qw(
+        log_ident
+        log_facility
+        db_data_source
+        db_username
+        db_password
+        temp_dir
+        bicdir_dir
+    );
+    for my $key (@required_config_keys) {
+        if (!defined($cfg->{$key}) || $cfg->{$key} =~ /^\s*$/) {
+            die "Error reading required config parameter: $key";
+        }
+    }
+    
+    for my $dir_param ('temp_dir', 'bicdir_dir') {
+        unless (-d $cfg->{$dir_param}) {
+            die "Bad directory parameter: $dir_param";
+        }
+    }
+
+    openlog($cfg->{log_ident}, "ndelay,pid", $cfg->{log_facility});
+    $log = CyberFT::Utils::log_func_syslog("bicdir_export");
+
+    _log("info", "Start");
+    _log("info", "Export type: $type");
+    
+    if ($type eq 'increment') {
+        if ($export_date eq '') {
+            my @yesterday = Date::Calc::Add_Delta_YMD(Date::Calc::Today, 0, 0, -1);
+            $export_date = sprintf "%04d-%02d-%02d", @yesterday;
+        }
+    } else {
+         my @today = Date::Calc::Today;
+         $export_date = sprintf "%04d-%02d-%02d", @today;
+    }
+    _log("info", "Export date: $export_date");
+    
+    
+    _log("info", "Connecting to the database: " . $cfg->{db_data_source});
+    my $db = CyberFT::Database::new_instance($cfg);
+    my $res = $db->connect();
+    if ($res->{Result} ne '0') {
+        die('Database connection error: ' . $res->{ErrMsg});
+    }
+    
+    # Подготовка
+    my $prepare_res;
+    if ($type eq 'increment') {
+        $prepare_res = $db->export_prepare_daily({ExportDate => $export_date, Force => 1});
+    } else {
+        $prepare_res = $db->export_prepare_full({Force => 1});
+    }
+    if ($prepare_res->{Result} ne '0') {
+        _log("error", "Failed to prepare export: " . $prepare_res->{ErrCode} . ': ' . $prepare_res->{ErrMsg});
+        save_error($db, ERR_EXPORT_BICDIR, $type, 'Failed to prepare export');
+        return;
+    }
+    
+    # Экспорт записей
+    my $err = gen_bicdir($cfg, $db, $type, $export_date);
+    if ($err) {
+        _log("error", $err);
+        save_error($db, ERR_EXPORT_BICDIR, $type, 'Failed to process export');
+    }
+
+    # Завершение
+    my $finish_res;
+    if ($type eq 'increment') {
+        $finish_res = $db->export_finish_daily({ExportDate => $export_date});
+    } else {
+        $finish_res = $db->export_finish_full();
+    }
+    if ($finish_res->{Result} ne '0') {
+        _log("error", "Failed to finish export: " . $finish_res->{ErrCode} . ': ' . $finish_res->{ErrMsg});
+        save_error($db, ERR_EXPORT_BICDIR, $type, 'Failed to finish export');
+        return;
+    }
+    
+    _log("info", "Stop");
+}
+
+sub gen_bicdir {
+    my ($cfg, $db, $type, $export_date) = @_;
+     
+    my $sth = $db->dbh->prepare(get_export_query($type));
+    if (!$sth) {
+        return "Failed to prepare export query: " . $db->dbh->errstr;
+    }
+    
+    my $exec_res;
+    if ($type eq 'increment') {
+        $exec_res = $sth->execute($export_date);
+    } else {
+        $exec_res = $sth->execute();
+    }
+    if (!$exec_res) {
+        return "Failed to execute export query: " . $sth->errstr;
+    }
+     
+    my $temp_csv_filename = CyberFT::Utils::temp_filename($cfg->{temp_dir}, "bicdir_export_csv");
+    open(my $f, '>', $temp_csv_filename) or return "Failed to open temp BICDir file ($temp_csv_filename): $!";
+    
+    my $first_row = join(';', map {$_->{desc}} @$CSV_COLUMNS);
+    if ($CSV_ENCODING !~ /^(utf8|utf-8)$/i) {
+        my $converter = Text::Iconv->new('utf-8', $CSV_ENCODING);
+        $first_row = $converter->convert($first_row);
+    }
+    print $f $first_row . "\n";
+    
+    my $num_records = 0;
+    while (my $row = $sth->fetchrow_hashref()) {
+        $num_records++;
+        my @row;
+        for my $col (@$CSV_COLUMNS) {
+            my $val = $row->{$col->{db_name}};
+            $val =~ s/\r|\n/ /g;
+            $val =~ s/;/,/g;
+            if ($CSV_ENCODING !~ /^(utf8|utf-8)$/i) {
+                my $converter = Text::Iconv->new('utf-8', $CSV_ENCODING);
+                $val = $converter->convert($val);
+            }
+            push @row, $val;
+        }
+        print $f join(";", @row) . "\n";
+    }
+    if ($sth->err) {
+        close($f);
+        unlink($temp_csv_filename) if (-f $temp_csv_filename);
+        return "Failed to fetch row from db: " . $sth->errstr;
+    }
+    _log("info", "Export $num_records records");
+    
+    close($f);
+    
+    my $md5_sum = CyberFT::Utils::md5_sum_file($temp_csv_filename);
+    
+    my ($zip_filename, $csv_filename) = get_bicdir_filenames($cfg->{bicdir_dir}, $type, $export_date);
+    
+    my $info_filename = $zip_filename . '.info';
+    open(my $finfo, '>', $info_filename) or return "Failed to open info file ($info_filename): $!";
+    print $finfo "version=$CSV_VERSION\n";
+    print $finfo "encoding=$CSV_ENCODING\n";
+    print $finfo "md5_sum=$md5_sum\n";
+    print $finfo "num_records=$num_records\n";
+    print $finfo "created_at=" . sprintf("%04d-%02d-%02dT%02d:%02d:%02d", Date::Calc::Today_and_Now()) . "\n";
+    close($finfo);
+    
+    my $temp_zip_filename = CyberFT::Utils::temp_filename($cfg->{temp_dir}, "bicdir_export_zip");
+    my $zip = Archive::Zip->new();
+    unless ($zip->addFile($temp_csv_filename, $csv_filename)) {
+        unlink($temp_csv_filename) if (-f $temp_csv_filename);
+        return "Failed to add csv file to zip archive";
+    }
+    unless ($zip->writeToFileNamed($temp_zip_filename) == AZ_OK ) {
+       unlink($temp_csv_filename) if (-f $temp_csv_filename);
+       return "Failed to write zip archive";
+    }
+    unlink($temp_csv_filename) if (-f $temp_csv_filename);
+    
+    unless (File::Copy::move($temp_zip_filename, $zip_filename)) {
+        unlink($temp_csv_filename) if (-f $temp_csv_filename);
+        unlink($temp_zip_filename) if (-f $temp_zip_filename);
+        return "Failed to move BICDir file ($temp_zip_filename, $zip_filename): $!";
+    }
+    unlink($temp_zip_filename) if (-f $temp_zip_filename);
+    
+    _log("info", "Export file: $zip_filename");
+    return undef;
+}
+
+# Возвращает полный путь к готовому zip-архиву и имя csv внутри архива.
+sub get_bicdir_filenames {
+    my ($dir, $type, $date) = @_;
+    
+    $dir =~ s|/$||;
+    $date =~ s/(\d\d\d\d)-(\d\d)-(\d\d)/$1$2$3/;
+    
+    if ($date !~ /^\d{8}$/) {
+        die "get_bicdir_filename: date check failed: $date";
+    }
+    
+    if ($type eq 'increment') {
+        return (
+            $dir . '/' . 'BICDir_Increment_' . $date . '.zip', 
+            'BICDir_Increment_' . $date . '.csv',
+        );
+    } else {
+        return (
+            $dir . '/' . 'BICDir_All_' . $date . '.zip', 
+            'BICDir_All_' . $date . '.csv',
+        );
+    }
+}
+
+sub get_export_query {
+    my $type = shift;
+    my $query = q{
+        SELECT 
+            exp_id, member_code, swift_code,
+            member_name, registr_info, status,
+            blocked, block_info, lang_num, member_type,
+            parent_swift_code, eng_name, is_bank,
+            cntr_code2, city_name,   
+            TO_CHAR(valid_from, 'DD.MM.YYYY') AS valid_from,
+            TO_CHAR(valid_to, 'DD.MM.YYYY') AS valid_to,
+            website, member_phone 
+    };
+    if ($type eq 'increment') {
+        $query .= '    FROM w_exp_member_daily WHERE export_date = ?';
+    } else {
+        $query .= '    FROM w_exp_member_full';
+    }
+    return $query;
+}
+
+sub save_error {
+    my $db = shift;
+    my $err_number = shift;
+    my $param1 = shift // '';
+    my $param2 = shift // '';
+    my $param3 = shift // '';
+    my $sender = shift;
+    my $receiver = shift;
+    my $doc_type = shift;
+
+    my $res = $db->save_external_error({
+        Error         => $err_number,
+        Par1          => $param1,
+        Par2          => $param2,
+        Par3          => $param3,
+        CftBic        => $sender,
+        RecipientCode => $receiver,
+        DocType       => $doc_type,
+    });
+
+    if ($res->{Result} ne '0') {
+        _log('warning', "save_error: ($err_number, $param1, $param2, $param3, $sender, $receiver, $doc_type):".
+             "save_external_error error: " . $res->{ErrCode} . ': ' . $res->{ErrMsg});
+    }
+}
+
+sub _log{
+    my $type = shift;
+    my $msg = shift;
+    if (defined $log) {
+        $log->($type, $msg);
+    } else {
+        print STDERR "bicdir_export: <$type> $msg\n";
+    }
+};

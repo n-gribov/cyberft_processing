@@ -1,0 +1,17 @@
+CFLAGS  = -Imd5 -O2 -Wall -Lkyotocabinet-1.2.76 -Xlinker -rpath /home/shocker/projects/nextgen/cftmq/kyotocabinet-1.2.76 -Ikyotocabinet-1.2.76
+LDFLAGS = -levent_core -lkyotocabinet
+OBJS    = core.o stomp.o persist.o users.o config.o md5/md5c.o
+
+all: $(OBJS)
+	g++ $(CFLAGS) -o cftmq main.cpp $(OBJS) $(LDFLAGS)
+	strip cftmq
+#	rm -f $(OBJS)
+
+clean:
+	rm -f $(OBJS)
+
+.c.o:
+	gcc -c $(CFLAGS) -o $@ $<
+
+.cpp.o:
+	g++ -c $(CFLAGS) -o $@ $<

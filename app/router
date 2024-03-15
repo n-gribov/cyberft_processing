@@ -1,0 +1,42 @@
+#!/usr/bin/perl
+use strict;
+use utf8;
+use Data::Dumper;
+use FindBin;
+use Daemon::Control;
+
+use lib $FindBin::RealBin . '/lib';
+use CyberFT::Utils;
+
+# Прочитаем конфигурационный файл.
+my $cfg = CyberFT::Utils::read_app_config();
+unless (defined $cfg) {
+    die "Error reading config file (config/cyberft.cfg)";
+}
+unless (defined $cfg->{pid_file_router} && $cfg->{pid_file_router} =~ /\S+/) {
+    die "Error reading required config parameter: pid_file_router";
+}
+unless (defined $cfg->{workers_router}) {
+    die "Error reading required config parameter: workers_router";
+}
+unless ($cfg->{workers_router} =~ /^\d+$/ && $cfg->{workers_router} > 0 && $cfg->{workers_router} < 100) {
+    die "Bad value of config parameter: workers_router";
+}
+
+my $stderr_file = '/dev/null';
+if (defined $cfg->{stderr_file} && $cfg->{stderr_file} =~ /\S+/) {
+    $stderr_file = $cfg->{stderr_file};
+}
+
+for my $procid (1 .. $cfg->{workers_router}) {
+    Daemon::Control->new(
+        name         => "CyberFT Router #$procid",
+        scan_name    => qr/cyberft_router/,
+        kill_timeout => 3,
+        path         => $FindBin::RealBin,
+        program      => $FindBin::RealBin . "/scripts/cyberft_router.pl --procid=$procid",
+        pid_file     => $cfg->{pid_file_router} . ".$procid",
+        stdout_file  => '/dev/null',
+        stderr_file  => $stderr_file,
+    )->run_command(@ARGV);
+}

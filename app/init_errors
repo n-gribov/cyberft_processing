@@ -1,0 +1,106 @@
+#!/usr/bin/perl
+use strict;
+use utf8;
+use Data::Dumper;
+use Sys::Syslog;
+use FindBin;
+use lib $FindBin::RealBin . '/lib';
+use CyberFT::Utils;
+use CyberFT::Database;
+use CyberFT::Errors;
+
+
+my $log;
+
+eval {
+    main();
+};
+if (my $err = $@) {
+    _log("error", "Error in main(): $err");
+}
+
+sub main {
+    # Прочитаем конфигурационный файл.
+    my $cfg = CyberFT::Utils::read_app_config();
+    unless (defined $cfg) {
+        die "Error reading config file (config/cyberft.cfg)";
+    }
+
+    # Проверка присутствия обязательных параметров в конфиге.
+    my @required_config_keys = qw(
+        log_ident
+        log_facility
+        db_data_source
+        db_username
+        db_password
+    );
+    for my $key (@required_config_keys) {
+        if (!defined($cfg->{$key}) || $cfg->{$key} =~ /^\s*$/) {
+            die "Error reading required config parameter: $key";
+        }
+    }
+
+    openlog($cfg->{log_ident}, "ndelay,pid", $cfg->{log_facility});
+    $log = CyberFT::Utils::log_func_syslog("init_errors");
+
+    _log("info", "Start");
+    
+    _log("info", "Connecting to the database: " . $cfg->{db_data_source});
+    my $db = CyberFT::Database::new_instance($cfg);
+    my $res = $db->connect();
+    if ($res->{Result} ne '0') {
+        die('Database connection error: ' . $res->{ErrMsg});
+    }
+    
+    # Инициализация типов ошибок
+    my $error_types = $CyberFT::Errors::ErrorTypes;
+    for my $type (sort keys %$error_types) {        
+        _log("info", "Init error type #$type: " . CyberFT::Errors::type_name($type));
+        
+        my $res = $db->init_error_type({
+            ErrType  => $type,
+            Name     => $error_types->{$type},
+        });
+        
+        if ($res->{Result} ne '0') {
+            _log("error", "Cannot init error #$type: " . $res->{ErrMsg});
+        }
+    }  
+
+    # Инициализация описания ошибок
+    my $errors = $CyberFT::Errors::Errors;
+    for my $errnum (sort keys %$errors) {
+        _log("info", "Init error #$errnum: " . CyberFT::Errors::desc($errnum));
+        
+        my $res = $db->init_error_info({
+            ErrNum       => $errnum,
+            Descr        => $errors->{$errnum}->{desc},
+            DetailDescr  => $errors->{$errnum}->{desc},
+            Message      => $errors->{$errnum}->{msg},
+            ParCnt       => scalar(@{$errors->{$errnum}->{params}}),
+            Par1Descr    => $errors->{$errnum}->{params}->[0] // '',
+            Par2Descr    => $errors->{$errnum}->{params}->[1] // '',
+            Par3Descr    => $errors->{$errnum}->{params}->[2] // '',
+            ErrType      => $errors->{$errnum}->{type},
+            Level        => $errors->{$errnum}->{lvl},
+        });
+        
+        if ($res->{Result} ne '0') {
+            _log("error", "Cannot init error #$errnum: " . $res->{ErrMsg});
+        }
+    }    
+    
+    _log("info", "Stop");
+    return 1;
+}
+
+sub _log{
+    my $type = shift;
+    my $msg = shift;
+    if (defined $log) {
+        $log->($type, $msg);
+        print "init_errors: <$type> $msg\n";
+    } else {
+        print STDERR "init_errors: <$type> $msg\n";
+    }
+};

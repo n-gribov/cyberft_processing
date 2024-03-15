@@ -1,0 +1,13 @@
+.idea
+*.iml
+.vscode
+
+!**/.gitkeep
+
+app/utils/*.yml
+!utils/*-sample.yml
+
+runtime/*/logs/**
+runtime/*/storage/**
+config/keys/*
+config/cyberft.cfg

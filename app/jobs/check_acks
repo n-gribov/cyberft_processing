@@ -1,0 +1,279 @@
+#!/usr/bin/perl
+use strict;
+use Data::Dumper;
+use File::Copy ();
+use Sys::Syslog;
+use FindBin;
+use Crypt::OpenSSL::X509 ();
+use lib $FindBin::RealBin . '/../lib';
+use CyberFT::Utils;
+use CyberFT::Broker;
+use CyberFT::Database;
+use CyberFT::Envelope;
+use CyberFT::Errors;
+
+# Имя в списке процессов
+$0 = 'cyberft_ckeck_acks';
+
+my $log;
+my $pid_file;
+
+eval {
+    main();
+};
+if (my $err = $@) {
+    _log("error", "Error in main(): $err");
+}
+
+if (defined $pid_file && -f $pid_file) {
+    CyberFT::Utils::read_file($pid_file, \my $pid);
+    if ($pid == $$) {
+        unlink($pid_file);
+    }
+}
+
+sub main {
+    # Прочитаем конфигурационный файл.
+    my $cfg = CyberFT::Utils::read_app_config();
+    unless (defined $cfg) {
+        die "Error reading config file (config/cyberft.cfg)";
+    }
+
+    # Проверка присутствия обязательных параметров в конфиге.
+    my @required_config_keys = qw(
+        pid_file_check_acks
+        log_ident
+        log_facility
+        broker_host
+        broker_port
+        broker_username
+        broker_password
+        db_data_source
+        db_username
+        db_password
+        sys_id
+        sys_certificate_file
+        sys_private_key_file
+        sys_private_key_password
+    );
+    for my $key (@required_config_keys) {
+        if (!defined($cfg->{$key}) || $cfg->{$key} =~ /^\s*$/) {
+            die "Error reading required config parameter: $key";
+        }
+    }
+
+    openlog($cfg->{log_ident}, "ndelay,pid", $cfg->{log_facility});
+    $log = CyberFT::Utils::log_func_syslog("check_acks");
+
+    _log("info", "Start");
+
+    # Проверим pid-файл
+    $pid_file = $cfg->{pid_file_check_acks};
+    if (CyberFT::Utils::check_pid($pid_file, qr/check_acks/)) {
+        _log("info", "Script is already running");
+        return;
+    }
+    CyberFT::Utils::write_pid($pid_file);
+
+    # Подключимся к базе данных
+    _log("info", "Connecting to the database: " . $cfg->{db_data_source});
+    my $db = CyberFT::Database::new_instance($cfg);
+    my $res_connect = $db->connect();
+    if ($res_connect->{Result} ne '0') {
+        _log("error", 'Database connection error: ' . $res_connect->{ErrMsg});
+        save_error($db, ERR_CHECK_ACKS, 'Failed to connect to the database');
+        return;
+    }
+
+    # Подключимся к брокеру.
+    _log('info', 'Connecting to the message broker: ' . $cfg->{broker_host} . ':' . $cfg->{broker_port});
+    my $broker = CyberFT::Broker->new;
+    my $r = $broker->connect(
+        $cfg->{broker_host},
+        $cfg->{broker_port},
+        $cfg->{broker_username},
+        $cfg->{broker_password},
+        $log,
+        10,
+    );
+    if ($r->{Result} ne '0') {
+        _log("error", 'Message broker connection error: ' . $r->{ErrMsg});
+        save_error($db, ERR_CHECK_ACKS, 'Failed to connect to the message broker');
+        return;
+    }
+
+    # Прочитаем сертификат.
+    my $cert_file = $cfg->{sys_certificate_file};
+    my ($cert, $subject, $fingerprint);
+    eval {
+        ($cert, $subject, $fingerprint) = load_certificate($cert_file);
+    };
+    if (my $err = $@) {
+        _log("error", "Failed to load certificate info ($cert_file): " . $err);
+        save_error($db, ERR_CHECK_ACKS, 'Failed to load certificate info');
+        return;
+    }
+    $cfg->{sys_cert_subject} = $subject;
+    $cfg->{sys_cert_fingerprint} = $fingerprint;
+
+    while (1) {
+        my $ok = check_one_ack($cfg, $db, $broker, $log);
+        last unless ($ok);
+    }
+
+    $db->disconnect;
+    $broker->disconnect;
+
+    _log("info", "Stop");
+}
+
+sub check_one_ack {
+    my ($cfg, $db, $broker, $log) = @_;
+
+    my $r = $db->get_next_unconfirmed_sent({});
+    if ($r->{Result} ne '0') {
+        _log("error", "Failed get_next_unconfirmed_sent: " . $r->{ErrMsg});
+        save_error($db, ERR_CHECK_ACKS, 'Failed to get next unconfirmed message');
+        return 0;
+    }
+
+    if (!defined $r->{Message} || $r->{Message} == 0) {
+        _log("info", "No unconfirmed messages found");
+        return 0;
+    }
+
+    my $sender_id = $r->{SenderSwift};
+    my $doc_id = $r->{SenderMsgCode};
+    my $next_id = $r->{NextSwift};
+    my $another_segment = $r->{AnotherSegment};
+    my $addr = $r->{RcvLoginAddr};
+    my $qlen = $r->{RcvQueueLen};
+    my $qlen_str = (defined $qlen) ? $qlen : 'undefined';
+
+    my ($xml, $chkack_doc_id) = gen_chkack($cfg, $next_id, $doc_id, $sender_id, $db);
+    unless (defined $xml) {
+        return 0;
+    }
+
+    my $headers = {
+        'doc_id'    => $chkack_doc_id,
+        'sender_id' => $cfg->{sys_id},
+        'doc_type'  => 'CFTChkAck',
+    };
+
+    if ($another_segment) {
+        _log("info", "Sending remote ChkAck: next_id=$next_id; ref_sender_id=$sender_id; ref_doc_id=$doc_id; chkack_doc_id=$chkack_doc_id");
+        my ($host, $port, $pass) = split(':', $addr);
+        _log("info", "Connecting to remote broker: $next_id ($host:$port)");
+        if (!defined($host) || $host eq '' || !defined($port) || $port eq '' || !defined($pass) || $pass eq '') {
+            _log("warning", "Cannot connect to remote broker: Empty host, port or password part of login_addr");
+            save_error($db, ERR_CHECK_ACKS, 'Cannot connect to remote broker: Empty host, port or password part of login_addr');
+            return 1;
+        }
+
+        my $r_broker = CyberFT::Broker->new;
+        my $r = $r_broker->connect($host, $port, $cfg->{sys_id}, $pass, $log, 10);
+        if ($r->{Result} ne '0') {
+            _log('warning', 'Remote broker connection error: ' . $r->{ErrMsg});
+            save_error($db, ERR_CHECK_ACKS, 'Remote broker connection error');
+            return 1;
+        }
+
+        $r = $r_broker->send_frame('INPUT', $xml, $headers);
+        if ($r->{Result} ne '0') {
+            _log('warning', 'Remote broker send_frame error: ' . $r->{ErrMsg});
+            save_error($db, ERR_CHECK_ACKS, 'Remote broker frame send error');
+            return 1;
+        }
+    }
+    else {
+        _log("info", "Sending local ChkAck: next_id=$next_id; ref_sender_id=$sender_id; ref_doc_id=$doc_id; qlen=$qlen_str; chkack_doc_id=$chkack_doc_id");
+        if (defined $qlen && $qlen ne '') {
+            $headers->{'max-num'} = $qlen;
+        }
+        $r = $broker->send_frame($next_id, $xml, $headers);
+        if ($r->{Result} ne '0') {
+            _log('warning', 'Broker send_frame error: ' . $r->{ErrMsg});
+            save_error($db, ERR_CHECK_ACKS, 'Broker frame send error');
+            return 1;
+        }
+    }
+
+    return 1;
+}
+
+sub gen_chkack {
+    my $cfg = shift;
+    my $to = shift;
+    my $doc_id = shift;
+    my $sender_id = shift;
+    my $db = shift;
+
+    my $report_xml = "";
+    $report_xml .= q{<ChkAck xmlns="http://cyberft.ru/xsd/cftdata.01">};
+    $report_xml .= q{<RefDocId>} . $doc_id . q{</RefDocId>};
+    $report_xml .= q{<RefSenderId>} . $sender_id . q{</RefSenderId>};
+    $report_xml .= q{</ChkAck>};
+
+    # Завернем отчет в стандартный xml-конверт CyberFT.
+    my $r = CyberFT::Envelope::create_signed(
+        doc_type         => 'CFTChkAck',
+        sender_id        => $cfg->{sys_id},
+        receiver_id      => $to,
+        body_mime        => 'application/xml',
+        body             => $report_xml,
+        cert_subject     => $cfg->{sys_cert_subject},
+        cert_fingerprint => $cfg->{sys_cert_fingerprint},
+        cert_file        => $cfg->{sys_certificate_file},
+        pkey_file        => $cfg->{sys_private_key_file},
+        pkey_pwd         => $cfg->{sys_private_key_password},
+    );
+
+    if ($r->{Result} ne '0') {
+        _log('error', 'gen_chkack: CyberFT::Envelope::create error: ' . $r->{ErrMsg});
+        save_error($db, ERR_CHECK_ACKS, 'Failed to create ChkAck document');
+        return undef;
+    }
+
+    return ($r->{Content}, $r->{DocId});
+}
+
+sub save_error {
+    my $db = shift;
+    my $err_number = shift;
+    my $param1 = shift // '';
+    my $param2 = shift // '';
+    my $param3 = shift // '';
+
+    my $res = $db->save_external_error({
+        Error => $err_number,
+        Par1  => $param1,
+        Par2  => $param2,
+        Par3  => $param3,
+    });
+
+    if ($res->{Result} ne '0') {
+        _log('warning', "save_error: ($err_number, $param1, $param2, $param3):".
+             "save_external_error error: " . $res->{ErrCode} . ': ' . $res->{ErrMsg});
+    }
+}
+
+sub load_certificate {
+    my $cert_file = shift;
+    CyberFT::Utils::read_file($cert_file, \my $cert_string);
+    my $x509 = Crypt::OpenSSL::X509->new_from_string($cert_string);
+    my $subject = $x509->subject();
+    my $fingerprint = uc($x509->fingerprint_sha1());
+    $fingerprint =~ s/://g;
+    return ($cert_string, $subject, $fingerprint);
+}
+
+sub _log{
+    my $type = shift;
+    my $msg = shift;
+    if (defined $log) {
+        $log->($type, $msg);
+    } else {
+        print STDERR "recv_acks: <$type> $msg\n";
+    }
+};

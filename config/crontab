@@ -1,0 +1,16 @@
+*/1     *       *       *       *      /var/www/cyberft_mq/app/jobs/users_sync
+*/1     *       *       *       *      /var/www/cyberft_mq/app/jobs/recv_acks
+*/2     *       *       *       *      /var/www/cyberft_mq/app/jobs/check_acks
+*/10    *       *       *       *      /var/www/cyberft_mq/app/jobs/bicdir_request
+0       3       *       *       *      /var/www/cyberft_mq/app/jobs/bicdir_export --type=increment
+30      3       *       *       *      /var/www/cyberft_mq/app/jobs/bicdir_export --type=all
+0       9       *       *       1      /var/www/cyberft_mq/app/jobs/send_expiring_keys_report
+0       2       *       *       *      /var/www/cyberft_mq/app/jobs/run_db_job remove_reserved_members
+30      1       *       *       *      /var/www/cyberft_mq/app/jobs/run_db_job del_key_expired
+*/3     *       *       *       *      /var/www/cyberft_mq/app/jobs/run_db_job do_system_actions
+3       *       *       *       *      /var/www/cyberft_mq/app/jobs/bicdir_request --force
+
+0       0       *       *       *      find /var/www/cyberft_mq/runtime/mq/storage -name "*.blob" -mtime +14 -delete
+
+# Only for Postgres
+# 30    18-21       *       *       *      /var/www/cyberft_mq/app/jobs/load_currency_rates.pl

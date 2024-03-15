@@ -1,0 +1,270 @@
+#!/usr/bin/perl
+
+# Usage:
+#     bicdir_request
+#     bicdir_request --force
+
+use strict;
+use Data::Dumper;
+use File::Copy ();
+use Sys::Syslog;
+use FindBin;
+use Encode;
+use Date::Calc ();
+use Getopt::Long;
+use Crypt::OpenSSL::X509 ();
+use Digest::MD5 ();
+
+use lib $FindBin::RealBin . '/../lib';
+use CyberFT::Utils;
+use CyberFT::Database;
+use CyberFT::Envelope;
+use CyberFT::Errors;
+
+
+# Имя в списке процессов
+$0 = 'cyberft_bicdir_request';
+
+my $log;
+my $pid_file;
+
+eval {
+    main();
+};
+if (my $err = $@) {
+    _log("error", "Error in main(): $err");
+}
+
+if (defined $pid_file && -f $pid_file) {
+    CyberFT::Utils::read_file($pid_file, \my $pid);
+    if ($pid == $$) {
+        unlink($pid_file);
+    }
+}
+
+sub main {
+    # Прочитаем конфигурационный файл.
+    my $cfg = CyberFT::Utils::read_app_config();
+    unless (defined $cfg) {
+        die "Error reading config file (config/cyberft.cfg)";
+    }
+
+    # Проверка присутствия обязательных параметров в конфиге.
+    my @required_config_keys = qw(
+        pid_file_bicdir_request
+        log_ident
+        log_facility
+        db_data_source
+        db_username
+        db_password
+        sys_id
+        sys_certificate_file
+        sys_private_key_file
+        sys_private_key_password
+    );
+    for my $key (@required_config_keys) {
+        if (!defined($cfg->{$key}) || $cfg->{$key} =~ /^\s*$/) {
+            die "Error reading required config parameter: $key";
+        }
+    }
+
+    openlog($cfg->{log_ident}, "ndelay,pid", $cfg->{log_facility});
+    $log = CyberFT::Utils::log_func_syslog("bicdir_request");
+
+    _log("info", "Start");
+
+    # Проверим pid-файл
+    $pid_file = $cfg->{pid_file_bicdir_request};
+    if (CyberFT::Utils::check_pid($pid_file, qr/bicdir_request/)) {
+        _log("info", "Script is already running");
+        return 0;
+    }
+    CyberFT::Utils::write_pid($pid_file);
+
+    # Подключимся к базе данных
+    _log("info", "Connecting to the database: " . $cfg->{db_data_source});
+    my $db = CyberFT::Database::new_instance($cfg);
+    my $res_connect = $db->connect();
+    if ($res_connect->{Result} ne '0') {
+        _log("error", 'Database connection error: ' . $res_connect->{ErrMsg});
+        return 0;
+    }
+
+    my $force;
+    GetOptions('force' => \$force);
+
+    if ($force) {
+        my $sys_params = $db->get_sys_params();
+        my $parent_processing = $sys_params->{PARENT_PROCESSING};
+        if (!$parent_processing) {
+            return 0;
+        }
+        _log("info", "Force full BICDir update request to parent processing ($parent_processing)");
+        send_request($cfg, $db, 'all', $parent_processing);
+    }
+    else {
+        my $res_start = $db->import_check_request({});
+        if ($res_start->{Result} ne '0') {
+            _log("error", 'Failed to check request: ' . $res_start->{ErrCode} . ': ' . $res_start->{ErrMsg});
+            return 0;
+        }
+
+        my $request_type = $res_start->{RequestType};
+        my $request_date = $res_start->{RequestDate};
+        my $parent_processing = $res_start->{ParentProc};
+
+        if ($request_type == 0) {
+            _log("info", "Request not needed");
+        }
+        elsif ($request_type == 1) {
+            _log("info", "Request: 'increment', '$parent_processing', '$request_date'");
+            send_request($cfg, $db, 'increment', $parent_processing, $request_date);
+        }
+        elsif ($request_type == 2) {
+            _log("info", "Request: 'all', '$parent_processing'");
+            send_request($cfg, $db, 'all', $parent_processing);
+        }
+        else {
+            _log("error", "Unknown request type: $request_type");
+            save_error($db, ERR_REQUEST_BICDIR, "Unknown request type ($request_type)");
+        }
+
+        if ($res_start->{RequestType} != 0) {
+            my $res_end = $db->import_finish_request({RequestType => $res_start->{RequestType}});
+            if ($res_end->{Result} ne '0') {
+                _log("error", 'Failed to finish request: ' . $res_end->{ErrCode} . ': ' . $res_end->{ErrMsg});
+                return 0;
+            }
+        }
+    }
+
+    $db->disconnect;
+    _log("info", "Stop");
+    return 1;
+}
+
+sub send_request {
+    my ($cfg, $db, $type, $receiver, $dt) = @_;
+
+    my $body;
+    if ($type eq 'increment') {
+        my @datetime;
+        if ($dt =~ /^(\d\d\d\d)-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)/) {
+            @datetime = ($1, $2, $3, $4, $5, $6);
+        } else {
+            _log("error", 'Failed to parse request date ($dt)');
+            save_error($db, ERR_REQUEST_BICDIR, 'Failed to parse request date');
+            return;
+        }
+        $body .= q{<BICDirectoryUpdateRequest xmlns="http://cyberft.ru/xsd/cftsys.02">};
+        $body .= q{<IncrementLoadRequest>};
+        $body .= q{<ContentFormat>BICDirCSV/1.0</ContentFormat>};
+        $body .= q{<StartDate>} . sprintf('%04d-%02d-%02d', @datetime) . q{</StartDate>};
+        $body .= q{</IncrementLoadRequest>};
+        $body .= q{</BICDirectoryUpdateRequest>};
+    }
+    else {
+        $body .= q{<BICDirectoryUpdateRequest xmlns="http://cyberft.ru/xsd/cftsys.02">};
+        $body .= q{<FullLoadRequest>};
+        $body .= q{<ContentFormat>BICDirCSV/1.0</ContentFormat>};
+        $body .= q{</FullLoadRequest>};
+        $body .= q{</BICDirectoryUpdateRequest>};
+    }
+
+    my $cert_file = $cfg->{sys_certificate_file};
+    my ($cert, $subject, $fingerprint);
+    eval {
+        ($cert, $subject, $fingerprint) = load_certificate($cert_file);
+    };
+    if (my $err = $@) {
+        _log("error", "Failed to load certificate info ($cert_file): " . $err);
+        save_error($db, ERR_REQUEST_BICDIR, 'Failed to load certificate info');
+        return;
+    }
+
+    my ($xml_date, $db_date) = CyberFT::Utils::gen_timestamps();
+
+    my $res = CyberFT::Envelope::create_signed(
+            doc_type         => 'BICDirRequest',
+            doc_date         => $xml_date,
+            sender_id        => $cfg->{sys_id},
+            receiver_id      => $receiver,
+            body_mime        => 'application/xml',
+            body             => $body,
+            cert_subject     => $subject,
+            cert_fingerprint => $fingerprint,
+            cert_file        => $cfg->{sys_certificate_file},
+            pkey_file        => $cfg->{sys_private_key_file},
+            pkey_pwd         => $cfg->{sys_private_key_password},
+    );
+    if ($res->{Result} ne '0') {
+        _log("error", 'Failed to create signed request: ' . $res->{ErrCode} . ': ' . $res->{ErrMsg});
+        save_error($db, ERR_REQUEST_BICDIR, 'Failed to create signed request');
+        return;
+    }
+
+    my $msg = $res->{Content};
+    my $doc_id =  $res->{DocId};
+
+    $res = $db->add_message({
+        MsgBody          => $msg,
+        SenderMsgCode    => $doc_id,
+        SenderSwift      => $cfg->{sys_id},
+        ReceiverSwift    => $receiver,
+        MsgCode          => 'BICDirRequest',
+        MessageLength    => length($msg),
+        FormatCode       => 'xml',
+        MsgHash          => Digest::MD5::md5_hex($msg),
+        Cmd              => 0,
+        ExtIsError       => 0,
+        DocTime          => $db_date,
+    });
+
+    if ($res->{Result} ne '0') {
+        _log("error", 'Failed to save request to db: ' . $res->{ErrCode} . ': ' . $res->{ErrMsg});
+        save_error($db, ERR_REQUEST_BICDIR, 'Failed to save request to database');
+        return;
+    }
+
+    return;
+}
+
+sub save_error {
+    my $db = shift;
+    my $err_number = shift;
+    my $param1 = shift // '';
+    my $param2 = shift // '';
+    my $param3 = shift // '';
+
+    my $res = $db->save_external_error({
+        Error => $err_number,
+        Par1  => $param1,
+        Par2  => $param2,
+        Par3  => $param3,
+    });
+
+    if ($res->{Result} ne '0') {
+        _log('warning', "save_error: ($err_number, $param1, $param2, $param3):".
+             "save_external_error error: " . $res->{ErrCode} . ': ' . $res->{ErrMsg});
+    }
+}
+
+sub load_certificate {
+    my $cert_file = shift;
+    CyberFT::Utils::read_file($cert_file, \my $cert_string);
+    my $x509 = Crypt::OpenSSL::X509->new_from_string($cert_string);
+    my $subject = $x509->subject();
+    my $fingerprint = uc($x509->fingerprint_sha1());
+    $fingerprint =~ s/://g;
+    return ($cert_string, $subject, $fingerprint);
+}
+
+sub _log{
+    my $type = shift;
+    my $msg = shift;
+    if (defined $log) {
+        $log->($type, $msg);
+    } else {
+        print STDERR "bicdir_request: <$type> $msg\n";
+    }
+};

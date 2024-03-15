@@ -1,0 +1,11 @@
+################################################
+# format:
+# login:alg:ALG(passcode+salt):salt:role
+#
+# alg: md5, sha256
+# role: nolimit, restricted, pull, proxy, router
+################################################
+
+admin:md5:d41d8cd98f00b204e9800998ecf8427e::admin
+root:md5:d41d8cd98f00b204e9800998ecf8427e::nolimit
+guest:sha256:084e0343a0486ff05530df6c705c8bb4d41d8cd98f00b204e9800998ecf8427e:sjk36dfhj21dvcs:restricted

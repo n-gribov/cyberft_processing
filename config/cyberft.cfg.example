@@ -1,0 +1,73 @@
+# Код данного процессинга в системе CyberFT
+sys_id =
+
+# Пути к pid-файлам
+pid_file_router         = /home/fwww/cyberft-processing/runtime/app/storage/temp/router.pid
+pid_file_forwarder      = /home/fwww/cyberft-processing/runtime/app/storage/temp/forwarder.pid
+pid_file_processor      = /home/fwww/cyberft-processing/runtime/app/storage/temp/processor.pid
+pid_file_users_sync     = /home/fwww/cyberft-processing/runtime/app/storage/temp/users_sync.pid
+pid_file_recv_acks      = /home/fwww/cyberft-processing/runtime/app/storage/temp/recv_acks.pid
+pid_file_check_acks     = /home/fwww/cyberft-processing/runtime/app/storage/temp/check_acks.pid
+pid_file_bicdir_request = /home/fwww/cyberft-processing/runtime/app/storage/temp/bicdir_request.pid
+
+# Директория для временных файлов
+temp_dir = /home/fwww/cyberft-processing/runtime/app/storage/temp
+
+# Директория для хранения обновлений справочника участников
+bicdir_dir = /home/fwww/cyberft-processing/runtime/app/storage/bicdir
+
+# Кол-во параллельных потоков обрабоки
+workers_router    = 1
+workers_forwarder = 1
+workers_processor = 1
+
+# Параметры логирования (syslog)
+log_facility = local0
+log_ident    = cyberft
+
+# Настройки STOMP-брокера
+broker_host           = localhost
+broker_port           = 40000
+broker_username       =
+broker_password       =
+broker_spool_dir      = /home/fwww/cyberft-processing/runtime/mq/storage
+broker_users_file     = /home/fwww/cyberft-processing/runtime/mq/storage/users
+broker_pid_file       = /var/run/cyberplat/cftmq.pid
+broker_admin_password =
+broker_max_body_size  = 1000000
+broker_chunk_size     = 1000000
+broker_chunk_timeout  = 15
+broker_cftcp_bin      = /usr/local/cyberplat/bin/cftcp
+
+# Параметры соединения с базой данных
+db_data_source = dbi:Pg:service=service_name
+db_username    =
+db_password    =
+
+db_cyberplat_data_source = dbi:Oracle:SID
+db_cyberplat_username    =
+db_cyberplat_password    =
+
+# Сертификат и ключ для подписи сообщений от процессинга
+sys_certificate_file     = /home/fwww/cyberft-processing/config/keys/cpcert.pem
+sys_private_key_file     = /home/fwww/cyberft-processing/config/keys/cpkey.pem
+sys_private_key_password =
+
+# Максимальный размер обрабатываемого XML-конверта (в байтах)
+envelope_max_size = 500000000
+
+# Email-адрес от которого будут отправляться информационные сообщения
+sys_email =
+smtp_host =
+
+# Режим отладки
+debug = 0
+
+# Перенаправление стандартного потока ошибок в файл
+stderr_file = /home/fwww/cyberft-processing/runtime/app/logs/stderr
+
+# Таймаут на чтение неотправленного документа из БД
+unsent_document_db_read_timeout = 3000
+
+# Преиод обновления файла со списком пользователей для брокера (в секундах)
+users_sync_update_interval = 30

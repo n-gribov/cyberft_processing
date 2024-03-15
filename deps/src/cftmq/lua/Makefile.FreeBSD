@@ -1,0 +1,7 @@
+CC	= g++
+CFLAGS	= -I/usr/local/include/lua51 -shared -fPIC -fno-rtti -fno-exceptions -I../
+LIBS	= -llua-5.1
+
+all:
+	$(CC) $(CFLAGS) -o luastomp.so luastomp.cpp ../stompc.cpp $(LIBS)
+#	lua51 sender.lua
